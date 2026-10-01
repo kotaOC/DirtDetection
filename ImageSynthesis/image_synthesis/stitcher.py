@@ -21,6 +21,15 @@ class StitchProgress:
     message: str
 
 
+@dataclass(frozen=True)
+class SeamComparison:
+    """Aligned views of one adjacent-image overlap and its blended result."""
+
+    left_source: np.ndarray
+    blended: np.ndarray
+    right_source: np.ndarray
+
+
 ProgressCallback = Callable[[StitchProgress], None]
 
 
@@ -46,6 +55,21 @@ class ImageStitcher:
         paths: Sequence[str | Path],
         progress: ProgressCallback | None = None,
     ) -> np.ndarray:
+        return self.stitch(self._read_files(paths, progress), progress)
+
+    def stitch_files_with_comparison(
+        self,
+        paths: Sequence[str | Path],
+        progress: ProgressCallback | None = None,
+    ) -> tuple[np.ndarray, list[SeamComparison], list[np.ndarray]]:
+        """Return the result and one three-way comparison per adjacent pair."""
+        return self.stitch_with_comparison(self._read_files(paths, progress), progress)
+
+    def _read_files(
+        self,
+        paths: Sequence[str | Path],
+        progress: ProgressCallback | None = None,
+    ) -> list[np.ndarray]:
         if len(paths) < 2:
             raise StitchError("合成する画像を2枚以上選択してください。")
         images: list[np.ndarray] = []
@@ -60,13 +84,21 @@ class ImageStitcher:
             if image is None:
                 raise StitchError(f"対応していない画像、または破損した画像です: {path}")
             images.append(image)
-        return self.stitch(images, progress)
+        return images
 
     def stitch(
         self,
         images: Sequence[np.ndarray],
         progress: ProgressCallback | None = None,
     ) -> np.ndarray:
+        result, _, _ = self.stitch_with_comparison(images, progress)
+        return result
+
+    def stitch_with_comparison(
+        self,
+        images: Sequence[np.ndarray],
+        progress: ProgressCallback | None = None,
+    ) -> tuple[np.ndarray, list[SeamComparison], list[np.ndarray]]:
         if len(images) < 2:
             raise StitchError("合成する画像を2枚以上指定してください。")
         normalized = [self._validate_image(image, i) for i, image in enumerate(images)]
@@ -85,7 +117,11 @@ class ImageStitcher:
                 f"合成結果が大きすぎます ({canvas_pixels / 1_000_000:.1f} MP)。"
                 "画像を縮小するか、選択枚数を減らしてください。"
             )
-        return self._blend(normalized, [translation @ t for t in transforms], size, progress)
+        canvas_transforms = [translation @ t for t in transforms]
+        blended = self._blend(normalized, canvas_transforms, size, progress)
+        comparisons = self._seam_comparisons(normalized, canvas_transforms, size, blended)
+        outlines = self._source_outlines(normalized, canvas_transforms, size)
+        return blended, comparisons, outlines
 
     def _estimate_transform(self, previous: np.ndarray, current: np.ndarray) -> np.ndarray:
         previous_gray = cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY)
@@ -97,27 +133,55 @@ class ImageStitcher:
         else:
             previous_work, current_work = previous_gray, current_gray
 
-        orb = cv2.ORB_create(nfeatures=self.max_features, fastThreshold=10)
-        key_prev, desc_prev = orb.detectAndCompute(previous_work, None)
-        key_cur, desc_cur = orb.detectAndCompute(current_work, None)
-        if desc_prev is not None and desc_cur is not None:
-            matches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(desc_cur, desc_prev, k=2)
-            good = [m for pair in matches if len(pair) == 2 for m, n in [pair] if m.distance < self.ratio_threshold * n.distance]
-            if len(good) >= self.min_matches:
-                src = np.float32([key_cur[m.queryIdx].pt for m in good]) / scale
-                dst = np.float32([key_prev[m.trainIdx].pt for m in good]) / scale
-                matrix, inliers = cv2.estimateAffinePartial2D(
-                    src, dst, method=cv2.RANSAC,
-                    ransacReprojThreshold=self.ransac_threshold,
-                    maxIters=3000, confidence=0.995,
-                )
-                inlier_count = int(inliers.sum()) if inliers is not None else 0
-                if matrix is not None and inlier_count >= self.min_matches:
-                    transform = np.vstack([matrix, [0.0, 0.0, 1.0]])
-                    self._check_transform(transform, current.shape)
-                    return transform
+        # Images are supplied from left to right.  Only compare the preceding
+        # image's right half with the following image's left half.  Features on
+        # stationary camera-side parts elsewhere in the frame must not win over
+        # the moving inspection surface in the overlap.
+        height = min(previous_work.shape[0], current_work.shape[0])
+        previous_mask = np.zeros(previous_work.shape, dtype=np.uint8)
+        current_mask = np.zeros(current_work.shape, dtype=np.uint8)
+        previous_mask[:height, previous_work.shape[1] // 2 :] = 255
+        current_mask[:height, : (current_work.shape[1] + 1) // 2] = 255
 
-        return self._phase_correlation_transform(previous_gray, current_gray)
+        detectors = [
+            (cv2.SIFT_create(nfeatures=self.max_features, contrastThreshold=0.01), cv2.NORM_L2),
+            (cv2.ORB_create(nfeatures=self.max_features, fastThreshold=5), cv2.NORM_HAMMING),
+        ]
+        for detector, norm in detectors:
+            key_prev, desc_prev = detector.detectAndCompute(previous_work, previous_mask)
+            key_cur, desc_cur = detector.detectAndCompute(current_work, current_mask)
+            if desc_prev is None or desc_cur is None:
+                continue
+            matches = cv2.BFMatcher(norm).knnMatch(desc_cur, desc_prev, k=2)
+            good = [
+                m
+                for pair in matches
+                if len(pair) == 2
+                for m, n in [pair]
+                if m.distance < self.ratio_threshold * n.distance
+            ]
+            if len(good) < self.min_matches:
+                continue
+            src = np.float32([key_cur[m.queryIdx].pt for m in good]) / scale
+            dst = np.float32([key_prev[m.trainIdx].pt for m in good]) / scale
+            matrix, inliers = cv2.estimateAffinePartial2D(
+                src,
+                dst,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=self.ransac_threshold,
+                maxIters=10000,
+                confidence=0.999,
+            )
+            inlier_count = int(inliers.sum()) if inliers is not None else 0
+            if matrix is not None and inlier_count >= self.min_matches:
+                transform = np.vstack([matrix, [0.0, 0.0, 1.0]])
+                self._check_transform(transform, current.shape)
+                return transform
+
+        raise StitchError(
+            "前画像の右半分と次画像の左半分から、十分な重なりを検出できませんでした。"
+            "撮影順と重複範囲を確認してください。"
+        )
 
     def _phase_correlation_transform(self, previous: np.ndarray, current: np.ndarray) -> np.ndarray:
         height = min(previous.shape[0], current.shape[0])
@@ -191,6 +255,76 @@ class ImageStitcher:
         ys, xs = np.where(valid_pixels)
         result = result[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
         return np.clip(result, 0, 255).astype(np.uint8)
+
+    def _seam_comparisons(
+        self,
+        images: Sequence[np.ndarray],
+        transforms: Sequence[np.ndarray],
+        size: tuple[int, int],
+        blended: np.ndarray,
+    ) -> list[SeamComparison]:
+        """Build aligned left/blended/right crops for every adjacent overlap."""
+        width, height = size
+        warped_images: list[np.ndarray] = []
+        valid_masks: list[np.ndarray] = []
+        for image, transform in zip(images, transforms):
+            h, w = image.shape[:2]
+            mask = np.full((h, w), 255, dtype=np.uint8)
+            warped_images.append(
+                cv2.warpPerspective(image, transform, (width, height), flags=cv2.INTER_LINEAR)
+            )
+            valid_masks.append(
+                cv2.warpPerspective(mask, transform, (width, height), flags=cv2.INTER_NEAREST) > 0
+            )
+
+        all_valid = np.logical_or.reduce(valid_masks)
+        all_ys, all_xs = np.where(all_valid)
+        canvas_y0, canvas_x0 = int(all_ys.min()), int(all_xs.min())
+        comparisons: list[SeamComparison] = []
+        for index in range(len(images) - 1):
+            overlap = valid_masks[index] & valid_masks[index + 1]
+            if not overlap.any():
+                raise StitchError(f"画像 {index + 1} と {index + 2} の比較範囲を生成できませんでした。")
+            ys, xs = np.where(overlap)
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            comparisons.append(
+                SeamComparison(
+                    left_source=warped_images[index][y0:y1, x0:x1].copy(),
+                    blended=blended[
+                        y0 - canvas_y0 : y1 - canvas_y0,
+                        x0 - canvas_x0 : x1 - canvas_x0,
+                    ].copy(),
+                    right_source=warped_images[index + 1][y0:y1, x0:x1].copy(),
+                )
+            )
+        return comparisons
+
+    @staticmethod
+    def _source_outlines(
+        images: Sequence[np.ndarray],
+        transforms: Sequence[np.ndarray],
+        size: tuple[int, int],
+    ) -> list[np.ndarray]:
+        """Return each source-image boundary in cropped result coordinates."""
+        width, height = size
+        valid_masks: list[np.ndarray] = []
+        for image, transform in zip(images, transforms):
+            h, w = image.shape[:2]
+            mask = np.full((h, w), 255, dtype=np.uint8)
+            valid_masks.append(
+                cv2.warpPerspective(mask, transform, (width, height), flags=cv2.INTER_NEAREST) > 0
+            )
+        all_valid = np.logical_or.reduce(valid_masks)
+        ys, xs = np.where(all_valid)
+        offset = np.float32([xs.min(), ys.min()])
+
+        outlines: list[np.ndarray] = []
+        for image, transform in zip(images, transforms):
+            h, w = image.shape[:2]
+            corners = np.float32([[[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]]])
+            outlines.append(cv2.perspectiveTransform(corners, transform)[0] - offset)
+        return outlines
 
     @staticmethod
     def _validate_image(image: np.ndarray, index: int) -> np.ndarray:

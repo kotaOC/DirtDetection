@@ -6,7 +6,7 @@
 
 - Python 3.9以上（3.11推奨）
 - Windows / macOS / Linux
-- PythonにTkinterが含まれていること（Windows公式版Pythonには標準で含まれます）
+- PySide6（`requirements.txt`から自動でインストールされます）
 
 ## セットアップ
 
@@ -59,7 +59,8 @@ pytest
 ## ファイル構成
 
 - `run.py`: GUI起動用スクリプト
-- `image_synthesis/app.py`: Tkinter GUI
+- `image_synthesis/qt_app.py`: 高DPI対応Qt GUI（標準の起動先）
+- `image_synthesis/app.py`: 旧Tkinter GUI（互換用）
 - `image_synthesis/stitcher.py`: 読み込み、位置合わせ、ブレンディング、保存
 - `tests/test_stitcher.py`: 合成処理と日本語パス保存の自動テスト
 - `requirements.txt`: 実行時依存関係

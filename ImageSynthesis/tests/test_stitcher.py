@@ -24,6 +24,41 @@ def test_stitches_overlapping_horizontal_images() -> None:
     assert np.mean(cv2.absdiff(result[:220, :900], scene)) < 8
 
 
+def test_produces_three_aligned_views_for_each_seam() -> None:
+    scene = make_scene()
+    previous = scene[:, :560]
+    current = cv2.convertScaleAbs(scene[:, 340:900], alpha=1.0, beta=18)
+
+    blended, comparisons, outlines = ImageStitcher().stitch_with_comparison([previous, current])
+
+    assert len(comparisons) == 1
+    comparison = comparisons[0]
+    assert comparison.left_source.shape == comparison.blended.shape
+    assert comparison.blended.shape == comparison.right_source.shape
+    assert comparison.blended.shape[1] < blended.shape[1]
+    assert np.mean(cv2.absdiff(comparison.left_source, comparison.right_source)) > 0.1
+    assert len(outlines) == 2
+    assert all(outline.shape == (4, 2) for outline in outlines)
+
+
+def test_uses_previous_right_and_current_left_for_registration() -> None:
+    scene = make_scene()
+    previous = scene[:, :640].copy()
+    current = scene[:, 460:900].copy()
+    current = cv2.copyMakeBorder(current, 0, 0, 0, 200, cv2.BORDER_CONSTANT, value=(35, 35, 35))
+
+    # A strong camera-fixed overlay creates many zero-motion features.  These
+    # must not override the actual overlap at the facing halves of the images.
+    for image in (previous, current):
+        cv2.rectangle(image, (210, 20), (430, 65), (0, 0, 0), -1)
+        cv2.circle(image, (320, 145), 38, (0, 0, 0), -1)
+
+    transform = ImageStitcher()._estimate_transform(previous, current)
+
+    assert transform[0, 2] == pytest.approx(460, abs=4)
+    assert transform[1, 2] == pytest.approx(0, abs=4)
+
+
 def test_requires_two_images() -> None:
     with pytest.raises(StitchError, match="2枚以上"):
         ImageStitcher().stitch([make_scene()])
