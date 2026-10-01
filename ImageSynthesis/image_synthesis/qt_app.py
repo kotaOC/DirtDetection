@@ -313,9 +313,11 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.paths: list[Path] = []
+        self.last_removed: tuple[Path, int] | None = None
         self.result: np.ndarray | None = None
         self.seam_comparisons: list[SeamComparison] = []
         self.source_outlines: list[np.ndarray] = []
+        self.last_error: str | None = None
         self.thread: QThread | None = None
         self.worker: StitchWorker | None = None
         self.setWindowTitle("Image Synthesis | 金属部品 画像合成")
@@ -446,11 +448,15 @@ class MainWindow(QMainWindow):
         self.remove_button.setObjectName("danger")
         self.remove_button.setFixedHeight(32)
         self.remove_button.clicked.connect(self._remove_selected)
+        self.undo_remove_button = QPushButton("↶  元に戻す")
+        self.undo_remove_button.setFixedHeight(32)
+        self.undo_remove_button.setToolTip("直前に削除した画像を元の位置へ戻す")
+        self.undo_remove_button.clicked.connect(self._undo_remove)
         self.clear_button = QPushButton("すべてクリア")
         self.clear_button.setFixedHeight(32)
         self.clear_button.clicked.connect(self._clear_all)
         danger.addWidget(self.remove_button)
-        danger.addStretch()
+        danger.addWidget(self.undo_remove_button)
         danger.addWidget(self.clear_button)
         layout.addLayout(danger)
         return panel
@@ -648,16 +654,31 @@ class MainWindow(QMainWindow):
         current = self.image_list.currentRow()
         if current < 0:
             return
-        del self.paths[current]
+        removed = self.paths.pop(current)
+        self.last_removed = (removed, current)
         self._rebuild_list(min(current, len(self.paths) - 1))
 
+    def _undo_remove(self) -> None:
+        if self.last_removed is None:
+            return
+        path, original_index = self.last_removed
+        self.last_removed = None
+        if path in self.paths:
+            self._rebuild_list(self.paths.index(path))
+            return
+        restored_index = min(original_index, len(self.paths))
+        self.paths.insert(restored_index, path)
+        self._rebuild_list(restored_index)
+
     def _clear_all(self) -> None:
-        if not self.paths or QMessageBox.question(self, "入力画像をクリア", "追加した画像をすべて取り除きますか？") != QMessageBox.StandardButton.Yes:
+        if not self.paths or not self._confirm_clear():
             return
         self.paths.clear()
+        self.last_removed = None
         self.result = None
         self.seam_comparisons = []
         self.source_outlines = []
+        self.last_error = None
         self.seam_selector.clear()
         self.viewer.clear_image()
         self.left_source_viewer.clear_image()
@@ -668,6 +689,27 @@ class MainWindow(QMainWindow):
         self.progress_value.setText("0%")
         self._rebuild_list()
 
+    def _confirm_clear(self) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("入力画像をクリア")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText("追加した画像をすべて取り除きますか？")
+        dialog.setInformativeText("合成結果と比較表示もクリアされます。")
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        yes_button = dialog.button(QMessageBox.StandardButton.Yes)
+        no_button = dialog.button(QMessageBox.StandardButton.No)
+        if yes_button is not None:
+            yes_button.setText("クリア")
+            yes_button.setObjectName("clearConfirm")
+        if no_button is not None:
+            no_button.setText("キャンセル")
+            no_button.setObjectName("cancelConfirm")
+        dialog.setStyleSheet(self._message_dialog_stylesheet())
+        return dialog.exec() == QMessageBox.StandardButton.Yes
+
     def _update_actions(self, *_args) -> None:
         busy = self.thread is not None and self.thread.isRunning()
         row = self.image_list.currentRow() if hasattr(self, "image_list") else -1
@@ -675,6 +717,7 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(self.result is not None and not busy)
         self.add_button.setEnabled(not busy)
         self.remove_button.setEnabled(row >= 0 and not busy)
+        self.undo_remove_button.setEnabled(self.last_removed is not None and not busy)
         self.clear_button.setEnabled(bool(self.paths) and not busy)
         self.up_button.setEnabled(row > 0 and not busy)
         self.down_button.setEnabled(0 <= row < len(self.paths) - 1 and not busy)
@@ -685,7 +728,12 @@ class MainWindow(QMainWindow):
             self.seam_selector.setEnabled(False)
         self.outline_button.setEnabled(self.result is not None)
         if not busy:
-            self._set_status("Ready" if len(self.paths) >= 2 else "Ready — 画像を2枚以上追加してください", "ready")
+            if self.last_error:
+                self._set_status("Error — 合成に失敗しました。詳細はエラー画面を確認してください。", "error")
+                self.status_text.setToolTip(self.last_error)
+            else:
+                self._set_status("Ready" if len(self.paths) >= 2 else "Ready — 画像を2枚以上追加してください", "ready")
+                self.status_text.setToolTip("")
 
     def _start(self) -> None:
         if len(self.paths) < 2:
@@ -693,10 +741,12 @@ class MainWindow(QMainWindow):
         self.result = None
         self.seam_comparisons = []
         self.source_outlines = []
+        self.last_error = None
         self.seam_selector.clear()
         self.progress.setValue(0)
         self.save_button.setEnabled(False)
         self._set_status("画像を読み込み中...", "working")
+        self.status_text.setToolTip("")
         self.thread = QThread(self)
         self.worker = StitchWorker(list(self.paths))
         self.worker.moveToThread(self.thread)
@@ -719,6 +769,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_completed(self, result: object) -> None:
+        self.last_error = None
         self.result, self.seam_comparisons, self.source_outlines = result  # type: ignore[misc]
         height, width = self.result.shape[:2]
         self.viewer.set_cv_image(self.result)
@@ -740,11 +791,41 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100)
         self.progress_value.setText("100%")
         self._set_status("Completed — 合成が完了しました", "success")
+        self.status_text.setToolTip("")
 
     @Slot(str)
     def _on_failed(self, text: str) -> None:
-        self._set_status("Error — 合成に失敗しました", "error")
-        QMessageBox.critical(self, "合成エラー", text)
+        self.last_error = text
+        self.progress_value.setText("ERROR")
+        self._set_status("Error — 合成に失敗しました。詳細はエラー画面を確認してください。", "error")
+        self.status_text.setToolTip(text)
+        self._show_error_dialog(text)
+
+    def _show_error_dialog(self, text: str) -> None:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("合成エラー")
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setText("画像を合成できませんでした。")
+        dialog.setInformativeText(text)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.setStyleSheet(self._message_dialog_stylesheet())
+        dialog.exec()
+
+    @staticmethod
+    def _message_dialog_stylesheet() -> str:
+        return f"""
+            QMessageBox {{ background: {COLORS['panel']}; }}
+            QMessageBox QLabel {{ color: {COLORS['text']}; font-size: 11pt; }}
+            QMessageBox QLabel#qt_msgbox_label,
+            QMessageBox QLabel#qt_msgbox_informativelabel {{ min-width: 600px; }}
+            QMessageBox QPushButton {{ min-width: 90px; min-height: 38px; background: {COLORS['card']};
+                                      color: {COLORS['text']}; border: 1px solid {COLORS['line2']}; }}
+            QMessageBox QPushButton:hover {{ background: #18304A; }}
+            QMessageBox QPushButton#clearConfirm {{ background: {COLORS['red']}; border-color: {COLORS['red2']}; }}
+            QMessageBox QPushButton#clearConfirm:hover {{ background: {COLORS['red2']}; }}
+            QMessageBox QPushButton#cancelConfirm {{ background: {COLORS['blue']}; border-color: {COLORS['blue2']}; }}
+            QMessageBox QPushButton#cancelConfirm:hover {{ background: {COLORS['blue2']}; }}
+            """
 
     @Slot()
     def _thread_finished(self) -> None:

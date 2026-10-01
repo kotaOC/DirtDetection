@@ -110,3 +110,60 @@ def test_double_click_opens_source_in_default_photo_app(tmp_path, monkeypatch) -
 
     assert [Path(value) for value in opened] == [path.resolve()]
     window.close()
+
+
+def test_stitch_error_remains_visible_in_status_area(monkeypatch) -> None:
+    app = qt_app()
+    window = MainWindow()
+    monkeypatch.setattr(window, "_show_error_dialog", lambda _text: None)
+    message = "画像 2 と画像 3 の重なりを検出できませんでした。"
+
+    window._on_failed(message)
+    window._update_actions()
+    app.processEvents()
+
+    assert window.status_text.text() == "Error — 合成に失敗しました。詳細はエラー画面を確認してください。"
+    assert window.status_text.toolTip() == message
+    assert window.progress_value.text() == "ERROR"
+    assert window.ready_label.text() == "Error"
+    window.close()
+
+
+def test_clear_uses_confirmation_dialog_and_resets_state(monkeypatch, tmp_path) -> None:
+    app = qt_app()
+    window = MainWindow()
+    path = tmp_path / "source.png"
+    save_image(path, np.zeros((40, 60, 3), dtype=np.uint8))
+    window.paths = [path]
+    window._rebuild_list(0)
+    monkeypatch.setattr(window, "_confirm_clear", lambda: True)
+
+    window._clear_all()
+    app.processEvents()
+
+    assert window.paths == []
+    assert window.image_list.count() == 0
+    assert window.result_size.text() == "NO RESULT"
+    assert window.status_text.text() == "Ready — 画像を2枚以上追加してください"
+    window.close()
+
+
+def test_last_removed_image_can_be_restored_to_original_position(tmp_path) -> None:
+    app = qt_app()
+    window = MainWindow()
+    paths = [tmp_path / f"image_{index}.png" for index in range(3)]
+    for path in paths:
+        save_image(path, np.zeros((20, 30, 3), dtype=np.uint8))
+    window.paths = list(paths)
+    window._rebuild_list(1)
+
+    window._remove_selected()
+    assert window.paths == [paths[0], paths[2]]
+    assert window.undo_remove_button.isEnabled()
+
+    window._undo_remove()
+    app.processEvents()
+    assert window.paths == paths
+    assert window.image_list.currentRow() == 1
+    assert not window.undo_remove_button.isEnabled()
+    window.close()
