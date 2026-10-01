@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dirt-detection-image-synthesis"
+version = "1.0.0"
+description = "Overlapping inspection image stitcher with a Tkinter GUI"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24,<3",
+  "opencv-python>=4.8,<5",
+  "Pillow>=10,<12",
+]
+
+[project.scripts]
+image-synthesis = "image_synthesis.app:main"
+
+[tool.setuptools.packages.find]
+include = ["image_synthesis*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
