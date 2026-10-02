@@ -4,6 +4,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from image_synthesis.qt_app import MainWindow
@@ -116,13 +117,13 @@ def test_stitch_error_remains_visible_in_status_area(monkeypatch) -> None:
     app = qt_app()
     window = MainWindow()
     monkeypatch.setattr(window, "_show_error_dialog", lambda _text: None)
-    message = "画像 2 と画像 3 の重なりを検出できませんでした。"
+    message = "継ぎ目 2（画像 2 と画像 3 の間）で位置合わせに失敗しました。\n重なりを検出できませんでした。"
 
     window._on_failed(message)
     window._update_actions()
     app.processEvents()
 
-    assert window.status_text.text() == "Error — 合成に失敗しました。詳細はエラー画面を確認してください。"
+    assert window.status_text.text() == "Error — 継ぎ目 2（画像 2 と画像 3 の間）で失敗しました。詳細はエラー画面を確認してください。"
     assert window.status_text.toolTip() == message
     assert window.progress_value.text() == "ERROR"
     assert window.ready_label.text() == "Error"
@@ -166,4 +167,48 @@ def test_last_removed_image_can_be_restored_to_original_position(tmp_path) -> No
     assert window.paths == paths
     assert window.image_list.currentRow() == 1
     assert not window.undo_remove_button.isEnabled()
+    window.close()
+
+
+def test_selecting_seam_centers_it_in_full_result() -> None:
+    app = qt_app()
+    window = MainWindow()
+    window.resize(1500, 900)
+    window.show()
+    crop = np.zeros((100, 160, 3), dtype=np.uint8)
+    comparisons = [
+        SeamComparison(crop, crop, crop, center=(300.0, 60.0)),
+        SeamComparison(crop, crop, crop, center=(2400.0, 60.0)),
+    ]
+    window._on_completed((np.zeros((120, 3000, 3), dtype=np.uint8), comparisons, []))
+    app.processEvents()
+
+    window.seam_selector.setCurrentIndex(1)
+    app.processEvents()
+
+    viewport_center = window.viewer.viewport().rect().center()
+    scene_center = window.viewer.mapToScene(viewport_center)
+    assert scene_center.x() == pytest.approx(2400.0, abs=3.0)
+    window.close()
+
+
+def test_partial_result_remains_visible_after_stitch_error(monkeypatch) -> None:
+    app = qt_app()
+    window = MainWindow()
+    monkeypatch.setattr(window, "_show_error_dialog", lambda _text: None)
+    partial = np.full((100, 800, 3), 90, dtype=np.uint8)
+
+    window._on_partial((partial, [], []))
+    window._on_failed(
+        "継ぎ目 2（画像 2 と画像 3 の間）で位置合わせに失敗しました。\n"
+        "画像 2 までの部分合成を表示します。"
+    )
+    window._thread_finished()
+    app.processEvents()
+
+    assert window.result is partial
+    assert (window.viewer._item.pixmap().width(), window.viewer._item.pixmap().height()) == (800, 100)
+    assert window.save_button.isEnabled()
+    assert window.ready_label.text() == "Error"
+    assert "継ぎ目 2" in window.status_text.text()
     window.close()

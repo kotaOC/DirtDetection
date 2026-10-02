@@ -13,6 +13,10 @@ import numpy as np
 class StitchError(RuntimeError):
     """Raised when selected images cannot be registered safely."""
 
+    def __init__(self, message: str, partial_output: object | None = None) -> None:
+        super().__init__(message)
+        self.partial_output = partial_output
+
 
 @dataclass(frozen=True)
 class StitchProgress:
@@ -28,6 +32,7 @@ class SeamComparison:
     left_source: np.ndarray
     blended: np.ndarray
     right_source: np.ndarray
+    center: tuple[float, float] = (0.0, 0.0)
 
 
 ProgressCallback = Callable[[StitchProgress], None]
@@ -106,7 +111,26 @@ class ImageStitcher:
 
         for index in range(1, len(normalized)):
             self._notify(progress, index, len(normalized) - 1, f"位置合わせ中: {index + 1} / {len(normalized)}")
-            current_to_previous = self._estimate_transform(normalized[index - 1], normalized[index])
+            try:
+                current_to_previous = self._estimate_transform(normalized[index - 1], normalized[index])
+            except StitchError as exc:
+                partial_images = normalized[:index]
+                partial_transforms = transforms[:index]
+                translation, partial_size = self._canvas_geometry(partial_images, partial_transforms)
+                canvas_transforms = [translation @ transform for transform in partial_transforms]
+                partial_blended = self._blend(partial_images, canvas_transforms, partial_size, None)
+                partial_comparisons = self._seam_comparisons(
+                    partial_images, canvas_transforms, partial_size, partial_blended
+                )
+                partial_outlines = self._source_outlines(
+                    partial_images, canvas_transforms, partial_size
+                )
+                raise StitchError(
+                    f"継ぎ目 {index}（画像 {index} と画像 {index + 1} の間）で"
+                    f"位置合わせに失敗しました。\n"
+                    f"画像 {index} までの部分合成を表示します。\n{exc}",
+                    partial_output=(partial_blended, partial_comparisons, partial_outlines),
+                ) from exc
             transforms.append(transforms[-1] @ current_to_previous)
 
         self._notify(progress, 0, 1, "合成範囲を計算中")
@@ -296,6 +320,10 @@ class ImageStitcher:
                         x0 - canvas_x0 : x1 - canvas_x0,
                     ].copy(),
                     right_source=warped_images[index + 1][y0:y1, x0:x1].copy(),
+                    center=(
+                        (x0 + x1) / 2.0 - canvas_x0,
+                        (y0 + y1) / 2.0 - canvas_y0,
+                    ),
                 )
             )
         return comparisons

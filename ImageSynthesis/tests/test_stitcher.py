@@ -37,6 +37,8 @@ def test_produces_three_aligned_views_for_each_seam() -> None:
     assert comparison.blended.shape == comparison.right_source.shape
     assert comparison.blended.shape[1] < blended.shape[1]
     assert np.mean(cv2.absdiff(comparison.left_source, comparison.right_source)) > 0.1
+    assert 0 <= comparison.center[0] < blended.shape[1]
+    assert 0 <= comparison.center[1] < blended.shape[0]
     assert len(outlines) == 2
     assert all(outline.shape == (4, 2) for outline in outlines)
 
@@ -62,6 +64,26 @@ def test_uses_previous_right_and_current_left_for_registration() -> None:
 def test_requires_two_images() -> None:
     with pytest.raises(StitchError, match="2枚以上"):
         ImageStitcher().stitch([make_scene()])
+
+
+def test_registration_error_identifies_image_pair(monkeypatch) -> None:
+    stitcher = ImageStitcher()
+    calls = 0
+
+    def estimate(_previous, _current):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise StitchError("十分な重なりを検出できませんでした。")
+        return np.eye(3, dtype=np.float64)
+
+    monkeypatch.setattr(stitcher, "_estimate_transform", estimate)
+    with pytest.raises(StitchError, match=r"継ぎ目 2（画像 2 と画像 3 の間）") as error:
+        stitcher.stitch([make_scene(), make_scene(), make_scene()])
+    partial_result, comparisons, outlines = error.value.partial_output
+    assert partial_result.shape == make_scene().shape
+    assert len(comparisons) == 1
+    assert len(outlines) == 2
 
 
 def test_save_and_reload_unicode_path(tmp_path) -> None:

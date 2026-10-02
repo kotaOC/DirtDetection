@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -92,6 +93,7 @@ QSplitter::handle {{ background: {COLORS['bg']}; width: 14px; }}
 class StitchWorker(QObject):
     progress = Signal(float, str)
     completed = Signal(object)
+    partial = Signal(object)
     failed = Signal(str)
     finished = Signal()
 
@@ -106,6 +108,8 @@ class StitchWorker(QObject):
             self.completed.emit(result)
         except Exception as exc:
             prefix = "" if isinstance(exc, StitchError) else "予期しないエラー: "
+            if isinstance(exc, StitchError) and exc.partial_output is not None:
+                self.partial.emit(exc.partial_output)
             self.failed.emit(prefix + str(exc))
         finally:
             self.finished.emit()
@@ -729,7 +733,7 @@ class MainWindow(QMainWindow):
         self.outline_button.setEnabled(self.result is not None)
         if not busy:
             if self.last_error:
-                self._set_status("Error — 合成に失敗しました。詳細はエラー画面を確認してください。", "error")
+                self._set_status(self._error_status_text(self.last_error), "error")
                 self.status_text.setToolTip(self.last_error)
             else:
                 self._set_status("Ready" if len(self.paths) >= 2 else "Ready — 画像を2枚以上追加してください", "ready")
@@ -753,6 +757,7 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
         self.worker.completed.connect(self._on_completed)
+        self.worker.partial.connect(self._on_partial)
         self.worker.failed.connect(self._on_failed)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -770,6 +775,17 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_completed(self, result: object) -> None:
         self.last_error = None
+        self._display_output(result)
+        self.progress.setValue(100)
+        self.progress_value.setText("100%")
+        self._set_status("Completed — 合成が完了しました", "success")
+        self.status_text.setToolTip("")
+
+    @Slot(object)
+    def _on_partial(self, result: object) -> None:
+        self._display_output(result)
+
+    def _display_output(self, result: object) -> None:
         self.result, self.seam_comparisons, self.source_outlines = result  # type: ignore[misc]
         height, width = self.result.shape[:2]
         self.viewer.set_cv_image(self.result)
@@ -785,21 +801,24 @@ class MainWindow(QMainWindow):
         self.seam_selector.blockSignals(False)
         if self.seam_comparisons:
             self.seam_selector.setCurrentIndex(0)
-            self._update_seam_comparison(0)
+            self._update_seam_comparison(0, center_full_view=False)
         self._set_comparison_buttons("blended")
         self.result_size.setText(f"{width:,} × {height:,} PX")
-        self.progress.setValue(100)
-        self.progress_value.setText("100%")
-        self._set_status("Completed — 合成が完了しました", "success")
-        self.status_text.setToolTip("")
 
     @Slot(str)
     def _on_failed(self, text: str) -> None:
         self.last_error = text
         self.progress_value.setText("ERROR")
-        self._set_status("Error — 合成に失敗しました。詳細はエラー画面を確認してください。", "error")
+        self._set_status(self._error_status_text(text), "error")
         self.status_text.setToolTip(text)
         self._show_error_dialog(text)
+
+    @staticmethod
+    def _error_status_text(text: str) -> str:
+        location = re.match(r"(継ぎ目 \d+（画像 \d+ と画像 \d+ の間）)", text)
+        if location:
+            return f"Error — {location.group(1)}で失敗しました。詳細はエラー画面を確認してください。"
+        return "Error — 合成に失敗しました。詳細はエラー画面を確認してください。"
 
     def _show_error_dialog(self, text: str) -> None:
         dialog = QMessageBox(self)
@@ -834,7 +853,7 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.worker = None
         self._update_actions()
-        if self.result is not None:
+        if self.result is not None and self.last_error is None:
             self._set_status("Completed — 合成が完了しました", "success")
 
     def _set_status(self, text: str, state: str) -> None:
@@ -876,13 +895,15 @@ class MainWindow(QMainWindow):
         self._set_comparison_buttons("seam")
 
     @Slot(int)
-    def _update_seam_comparison(self, index: int) -> None:
+    def _update_seam_comparison(self, index: int, center_full_view: bool = True) -> None:
         if not 0 <= index < len(self.seam_comparisons):
             return
         comparison = self.seam_comparisons[index]
         self.left_source_viewer.set_cv_image(comparison.left_source)
         self.blended_seam_viewer.set_cv_image(comparison.blended)
         self.right_source_viewer.set_cv_image(comparison.right_source)
+        if center_full_view and self.preview_stack.currentIndex() == 0:
+            self.viewer.centerOn(QPointF(*comparison.center))
 
     def _set_comparison_buttons(self, active: str) -> None:
         available = self.result is not None and bool(self.seam_comparisons)
